@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -15,18 +17,83 @@ import (
 // weather.gov REQUIRES a User-Agent identifying your app (contact email recommended).
 const userAgent = "my-weather-app/1.0 (you@example.com)"
 
+// Shared outbound client: safe for concurrent use and reuses connections.
 var client = &http.Client{Timeout: 10 * time.Second}
+
+// --- Thread-safe cache with optional expiry ---
+
+type cacheEntry[V any] struct {
+	value   V
+	expires time.Time // zero = never expires
+}
+
+type Cache[V any] struct {
+	mu    sync.Mutex
+	items map[string]cacheEntry[V]
+	ttl   time.Duration // 0 = keep forever
+}
+
+func NewCache[V any](ttl time.Duration) *Cache[V] {
+	c := &Cache[V]{items: map[string]cacheEntry[V]{}, ttl: ttl}
+	if ttl > 0 {
+		go c.janitor() // periodically drop expired entries so memory doesn't grow
+	}
+	return c
+}
+
+func (c *Cache[V]) Get(key string) (V, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.items[key]
+	if !ok || (!e.expires.IsZero() && time.Now().After(e.expires)) {
+		var zero V
+		return zero, false
+	}
+	return e.value, true
+}
+
+func (c *Cache[V]) Set(key string, v V) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := cacheEntry[V]{value: v}
+	if c.ttl > 0 {
+		e.expires = time.Now().Add(c.ttl)
+	}
+	c.items[key] = e
+}
+
+func (c *Cache[V]) janitor() {
+	for range time.Tick(time.Minute) {
+		now := time.Now()
+		c.mu.Lock()
+		for k, e := range c.items {
+			if now.After(e.expires) {
+				delete(c.items, k)
+			}
+		}
+		c.mu.Unlock()
+	}
+}
+
+// Caches:
+//   city|state  -> coordinates      (places don't move: keep forever)
+//   lat,lon     -> forecast URL     (NWS grid mapping rarely changes: keep forever)
+//   forecastURL -> forecast periods (NWS updates roughly hourly: 10 minutes is safe)
+var (
+	geoCache      = NewCache[coords](0)
+	pointsCache   = NewCache[string](0)
+	forecastCache = NewCache[[]Period](10 * time.Minute)
+)
 
 // --- Structs for the parts of the API responses we care about ---
 
 // Open-Meteo geocoding response: https://open-meteo.com/en/docs/geocoding-api
 type geocodeResponse struct {
 	Results []struct {
-		Name       string  `json:"name"`
-		Latitude   float64 `json:"latitude"`
-		Longitude  float64 `json:"longitude"`
-		Admin1     string  `json:"admin1"` // state, e.g. "Colorado"
-		Population int     `json:"population"`
+		Name      string  `json:"name"`
+		Latitude  float64 `json:"latitude"`
+		Longitude float64 `json:"longitude"`
+		Admin1    string  `json:"admin1"` // state, e.g. "Colorado"
 	} `json:"results"`
 }
 
@@ -59,9 +126,9 @@ type Forecast struct {
 	Periods  []Period `json:"periods"`
 }
 
-// getJSON performs a GET with the required headers and decodes the result.
-func getJSON(u string, out any) error {
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+// getJSON performs a GET tied to ctx: if the user disconnects, the upstream call is cancelled.
+func getJSON(ctx context.Context, u string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
@@ -118,28 +185,20 @@ type coords struct {
 	Name     string
 }
 
-// Cache lookups so repeat searches don't call the geocoder again.
-var (
-	geoCache   = map[string]coords{}
-	geoCacheMu sync.Mutex
-)
+var errBadInput = errors.New("please enter a city and pick a valid US state")
 
-func geocodeCity(city, state string) (coords, error) {
+func geocodeCity(ctx context.Context, city, state string) (coords, error) {
 	city = strings.TrimSpace(city)
 	fullState := stateName(state)
 	if city == "" || fullState == "" {
-		return coords{}, fmt.Errorf("please enter a city and pick a valid US state")
+		return coords{}, errBadInput
 	}
-	key := strings.ToLower(city + "|" + fullState)
 
-	geoCacheMu.Lock()
-	if c, ok := geoCache[key]; ok {
-		geoCacheMu.Unlock()
+	key := strings.ToLower(city + "|" + fullState)
+	if c, ok := geoCache.Get(key); ok {
 		return c, nil
 	}
-	geoCacheMu.Unlock()
 
-	// Search US places by name; we then pick the first result in the chosen state.
 	q := url.Values{}
 	q.Set("name", city)
 	q.Set("countryCode", "US") // weather.gov only covers the US
@@ -148,21 +207,15 @@ func geocodeCity(city, state string) (coords, error) {
 	q.Set("format", "json")
 
 	var g geocodeResponse
-	if err := getJSON("https://geocoding-api.open-meteo.com/v1/search?"+q.Encode(), &g); err != nil {
+	if err := getJSON(ctx, "https://geocoding-api.open-meteo.com/v1/search?"+q.Encode(), &g); err != nil {
 		return coords{}, err
 	}
 
-	// Results come back ranked by relevance/population, so the first state match is best.
+	// Results are ranked by relevance/population, so the first state match is best.
 	for _, r := range g.Results {
 		if strings.EqualFold(r.Admin1, fullState) {
-			c := coords{
-				Lat:  r.Latitude,
-				Lon:  r.Longitude,
-				Name: r.Name + ", " + r.Admin1,
-			}
-			geoCacheMu.Lock()
-			geoCache[key] = c
-			geoCacheMu.Unlock()
+			c := coords{Lat: r.Latitude, Lon: r.Longitude, Name: r.Name + ", " + r.Admin1}
+			geoCache.Set(key, c)
 			return c, nil
 		}
 	}
@@ -171,28 +224,39 @@ func geocodeCity(city, state string) (coords, error) {
 
 // --- Weather (lat/lon -> forecast) via api.weather.gov ---
 
-func fetchForecast(city, state string) (*Forecast, error) {
-	c, err := geocodeCity(city, state)
+func fetchForecast(ctx context.Context, city, state string) (*Forecast, error) {
+	c, err := geocodeCity(ctx, city, state)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 1: /points gives us the forecast URL for this grid square (max 4 decimals).
-	var p pointsResponse
-	if err := getJSON(fmt.Sprintf("https://api.weather.gov/points/%.4f,%.4f", c.Lat, c.Lon), &p); err != nil {
-		return nil, err
-	}
-	if p.Properties.Forecast == "" {
-		return nil, fmt.Errorf("no forecast available for this location")
+	// Step 1: /points -> forecast URL for this grid square (cached forever).
+	pointKey := fmt.Sprintf("%.4f,%.4f", c.Lat, c.Lon) // NWS wants max 4 decimals
+	forecastURL, ok := pointsCache.Get(pointKey)
+	if !ok {
+		var p pointsResponse
+		if err := getJSON(ctx, "https://api.weather.gov/points/"+pointKey, &p); err != nil {
+			return nil, err
+		}
+		if p.Properties.Forecast == "" {
+			return nil, fmt.Errorf("no forecast available for this location")
+		}
+		forecastURL = p.Properties.Forecast
+		pointsCache.Set(pointKey, forecastURL)
 	}
 
-	// Step 2: fetch the forecast periods.
-	var f forecastResponse
-	if err := getJSON(p.Properties.Forecast, &f); err != nil {
-		return nil, err
+	// Step 2: forecast periods (cached 10 minutes).
+	periods, ok := forecastCache.Get(forecastURL)
+	if !ok {
+		var f forecastResponse
+		if err := getJSON(ctx, forecastURL, &f); err != nil {
+			return nil, err
+		}
+		periods = f.Properties.Periods
+		forecastCache.Set(forecastURL, periods)
 	}
 
-	return &Forecast{Location: c.Name, Lat: c.Lat, Lon: c.Lon, Periods: f.Properties.Periods}, nil
+	return &Forecast{Location: c.Name, Lat: c.Lat, Lon: c.Lon, Periods: periods}, nil
 }
 
 // --- Handlers ---
@@ -201,12 +265,16 @@ func fetchForecast(city, state string) (*Forecast, error) {
 func apiForecastHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	city := r.URL.Query().Get("city")
-	state := r.URL.Query().Get("state")
-
-	fc, err := fetchForecast(city, state)
+	fc, err := fetchForecast(r.Context(), r.URL.Query().Get("city"), r.URL.Query().Get("state"))
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		if r.Context().Err() != nil {
+			return // client went away; nobody to respond to
+		}
+		status := http.StatusBadGateway // upstream API failed
+		if errors.Is(err, errBadInput) || strings.HasPrefix(err.Error(), "couldn't find") {
+			status = http.StatusBadRequest
+		}
+		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
@@ -219,7 +287,7 @@ var page = template.Must(template.New("page").Parse(`<!DOCTYPE html>
 .p{border-bottom:1px solid #ddd;padding:.5rem 0}.err{color:#b00}
 input,select,button{font-size:1rem;padding:.3rem}</style></head>
 <body>
-<h1>US City 7 Day Forecast</h1>
+<h1>NWS Forecast</h1>
 <form method="GET" action="/">
   <input name="city" value="{{.City}}" placeholder="City" required autofocus>
   <select name="state" required>
@@ -253,7 +321,11 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if data.City != "" || data.State != "" {
-		if fc, err := fetchForecast(data.City, data.State); err != nil {
+		fc, err := fetchForecast(r.Context(), data.City, data.State)
+		if err != nil {
+			if r.Context().Err() != nil {
+				return // client went away
+			}
 			data.Err = err.Error()
 		} else {
 			data.Forecast = fc
@@ -268,6 +340,16 @@ func main() {
 	mux.HandleFunc("/", indexHandler)
 	mux.HandleFunc("/api/forecast", apiForecastHandler)
 
+	// Timeouts stop slow or stalled clients from holding connections open forever.
+	srv := &http.Server{
+		Addr:              ":5000",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      40 * time.Second, // must exceed worst-case upstream time (3 calls x 10s)
+		IdleTimeout:       60 * time.Second,
+	}
+
 	log.Println("Listening on http://localhost:5000")
-	log.Fatal(http.ListenAndServe(":5000", mux))
+	log.Fatal(srv.ListenAndServe())
 }
