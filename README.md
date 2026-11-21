@@ -136,16 +136,16 @@ A repeat search within 10 minutes makes no outbound requests.
 
 1. Build an executable
 
-From the folder with main.go:
+- From the folder with main.go:
 
-powershell
+- powershell
 go build -o myapp.exe main.go
 
-Move it somewhere permanent, such as C:\Apps\myapp\myapp.exe. If you're building on Mac or Linux, cross-compile with GOOS=windows GOARCH=amd64 go build -o myapp.exe.
+- Move it somewhere permanent, such as C:\Apps\myapp\myapp.exe. If you're building on Mac or Linux, cross-compile with GOOS=windows GOARCH=amd64 go build -o myapp.exe.
 
-To hide the console window when the program runs in the background, build with:
+- To hide the console window when the program runs in the background, build with:
 
-powershell
+- powershell
 go build -ldflags "-H=windowsgui" -o myapp.exe main.go
 
-Press Win+R, type shell:startup, and put a shortcut to myapp.exe in that folder. It only runs after you log in, not at boot before sign-in.
+- Press Win+R, type shell:startup, and put a shortcut to myapp.exe in that folder. It only runs after you log in, not at boot before sign-in.
