@@ -130,7 +130,7 @@ A repeat search within 10 minutes makes no outbound requests.
 - **500/503 from api.weather.gov** — the NWS API has occasional outages; retry after a moment.
 - **No forecast for a location** — weather.gov only covers the US and its territories.
 
-## Here's how to setup the main.go file so that it runs automatically after each reboot:
+## Here's how to setup the main.go into a .exe file so that it runs automatically on a windows 10 laptop after each reboot:
 
   The most reliable way is to compile main.go into an .exe, then have Task Scheduler run it at startup. Building first is better than go run, because go run needs the Go toolchain and recompiles on every boot.
 
