@@ -129,3 +129,23 @@ A repeat search within 10 minutes makes no outbound requests.
 - **"couldn't find ... in ..."** — check the spelling; try the official city name (e.g. "Saint Louis" vs "St. Louis").
 - **500/503 from api.weather.gov** — the NWS API has occasional outages; retry after a moment.
 - **No forecast for a location** — weather.gov only covers the US and its territories.
+
+## Here's how to setup the main.go file so that it runs automatically after each reboot:
+
+  The most reliable way is to compile main.go into an .exe, then have Task Scheduler run it at startup. Building first is better than go run, because go run needs the Go toolchain and recompiles on every boot.
+
+1. Build an executable
+
+From the folder with main.go:
+
+powershell
+go build -o myapp.exe main.go
+
+Move it somewhere permanent, such as C:\Apps\myapp\myapp.exe. If you're building on Mac or Linux, cross-compile with GOOS=windows GOARCH=amd64 go build -o myapp.exe.
+
+To hide the console window when the program runs in the background, build with:
+
+powershell
+go build -ldflags "-H=windowsgui" -o myapp.exe main.go
+
+Press Win+R, type shell:startup, and put a shortcut to myapp.exe in that folder. It only runs after you log in, not at boot before sign-in.
