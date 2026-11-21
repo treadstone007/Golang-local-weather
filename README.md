@@ -133,19 +133,21 @@ A repeat search within 10 minutes makes no outbound requests.
 ## Here's how to setup the main.go into a .exe file so that it runs automatically on a windows 10 laptop after each reboot:
 
   The most reliable way is to compile main.go into an .exe, then have Task Scheduler run it at startup. Building first is better than go run, because go run needs the Go toolchain and recompiles on every boot.
-
-1. Build an executable
+  
+## Build an executable
 
 - From the folder with main.go:
 
 - powershell
-go build -o myapp.exe main.go
+  
+** go build -o myapp.exe main.go
 
 - Move it somewhere permanent, such as C:\Apps\myapp\myapp.exe. If you're building on Mac or Linux, cross-compile with GOOS=windows GOARCH=amd64 go build -o myapp.exe.
 
 - To hide the console window when the program runs in the background, build with:
 
 - powershell
-go build -ldflags "-H=windowsgui" -o myapp.exe main.go
+  
+** go build -ldflags "-H=windowsgui" -o myapp.exe main.go
 
 - Press Win+R, type shell:startup, and put a shortcut to myapp.exe in that folder. It only runs after you log in, not at boot before sign-in.
